@@ -1,5 +1,3 @@
-# purchase_order_router.py
-
 from fastapi import APIRouter, HTTPException, status, Depends
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
@@ -21,8 +19,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database import get_db_connection
 
 # --- Auth and Service URL Configuration ---
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="https://bleu-ums.onrender.com/auth/token")
-USER_SERVICE_ME_URL = "https://bleu-ums.onrender.com/auth/users/me"
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="https://bleu-ums.onrender.com//auth/token")
+USER_SERVICE_ME_URL = "https://bleu-ums.onrender.com//auth/users/me"
 
 # --- Define the new router ---
 router_purchase_order = APIRouter(
@@ -64,10 +62,28 @@ class ProcessingOrder(BaseModel):
 
     orderItems: List[ProcessingSaleItem]
 
+# --- NEW: Pydantic models for receiving an online order ---
+class OnlineSaleItem(BaseModel):
+    name: str
+    quantity: int
+    price: float
+    category: Optional[str] = "Online" # Default category
+    addons: Optional[dict] = {}
+
+class OnlineOrderRequest(BaseModel):
+    online_order_id: int
+    customer_name: str
+    order_type: str
+    payment_method: str
+    subtotal: float
+    total_amount: float
+    status: str
+    items: List[OnlineSaleItem]
+
 # --- NEW: Pydantic model for the status update request body ---
 class UpdateOrderStatusRequest(BaseModel):
     # Use Literal to restrict the possible values for the new status
-    newStatus: Literal["completed", "cancelled"]
+    newStatus: Literal["completed", "cancelled", "processing"] # Added processing for flexibility
 
 
 # --- API Endpoint to Get Processing Orders ---
@@ -107,7 +123,7 @@ async def get_processing_orders(
                     si.SaleItemID, si.ItemName, si.Quantity, si.UnitPrice, si.Category, si.Addons
                 FROM Sales AS s
                 LEFT JOIN SaleItems AS si ON s.SaleID = si.SaleID
-                WHERE s.Status IN ('completed', 'processing')
+            WHERE s.Status IN ('processing', 'completed')
             """
             params = []
 
@@ -176,9 +192,104 @@ async def get_processing_orders(
             await conn.close()
 
 
+# --- NEW: Endpoint to receive and save an online order ---
+@router_purchase_order.post(
+    "/online-order",
+    status_code=status.HTTP_201_CREATED,
+    summary="Save an online order to the POS system"
+)
+async def save_online_order(
+    order_data: OnlineOrderRequest,
+    current_user: dict = Depends(get_current_active_user)
+):
+    """
+    Receives an order from the online/cart service and saves it into the
+    local POS database (`Sales` and `SaleItems` tables). This operation
+    is transactional.
+    """
+    allowed_roles = ["admin", "staff", "cashier"]
+    if current_user.get("userRole") not in allowed_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to create orders."
+        )
+
+    conn = None
+    try:
+        conn = await get_db_connection()
+        async with conn.cursor() as cursor:
+            # Start a transaction
+            await conn.begin()
+
+            # 1. Insert into Sales table
+            discount_amount = Decimal(order_data.subtotal) - Decimal(order_data.total_amount)
+            
+            # Use customer_name as the CashierName for identification
+            # Use online_order_id in GCashReferenceNumber as a way to link back
+            sql_insert_sale = """
+                INSERT INTO Sales (
+                    OrderType, PaymentMethod, CashierName, TotalDiscountAmount, Status,
+                    GCashReferenceNumber, CreatedAt
+                )
+                OUTPUT INSERTED.SaleID
+                VALUES (?, ?, ?, ?, ?, ?, GETDATE())
+            """
+            await cursor.execute(
+                sql_insert_sale,
+                order_data.order_type,
+                order_data.payment_method,
+                order_data.customer_name,
+                discount_amount,
+                order_data.status,
+                f"ONLINE-{order_data.online_order_id}"
+            )
+            
+            sale_id_row = await cursor.fetchone()
+            if not sale_id_row:
+                raise Exception("Failed to create sale record and retrieve new SaleID.")
+            new_sale_id = sale_id_row.SaleID
+
+            # 2. Insert into SaleItems table for each item in the order
+            sql_insert_item = """
+                INSERT INTO SaleItems (SaleID, ItemName, Quantity, UnitPrice, Category, Addons)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """
+            for item in order_data.items:
+                await cursor.execute(
+                    sql_insert_item,
+                    new_sale_id,
+                    item.name,
+                    item.quantity,
+                    Decimal(item.price),
+                    item.category,
+                    json.dumps(item.addons) if item.addons else None
+                )
+            
+            # Commit the transaction if all inserts were successful
+            await conn.commit()
+            
+            logger.info(f"Successfully saved online order {order_data.online_order_id} as POS SaleID {new_sale_id}")
+            return {
+                "message": "Online order successfully saved to POS",
+                "pos_sale_id": new_sale_id
+            }
+
+    except Exception as e:
+        if conn:
+            await conn.rollback() # Roll back the transaction on any error
+        logger.error(f"Failed to save online order to POS: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred while saving the online order: {e}"
+        )
+    finally:
+        if conn:
+            await conn.close()
+
+
 # In purchase_order_router.py
 
-# --- NEW: Function to change the status of an order ---
+# --- Function to change the status of an order ---
 @router_purchase_order.patch(
     "/{order_id}/status",
     status_code=status.HTTP_200_OK,
@@ -201,24 +312,25 @@ async def update_order_status(
         )
 
     try:
+        # This logic handles both "SO-123" and just "123"
         parsed_id = int(order_id.split('-')[-1])
     except (ValueError, IndexError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid order ID format: '{order_id}'. Expected format 'SO-XXX'."
+            detail=f"Invalid order ID format: '{order_id}'. Expected format 'SO-XXX' or numeric ID."
         )
 
     conn = None
     try:
         conn = await get_db_connection()
         async with conn.cursor() as cursor:
-            # --- FIX: Removed the "UpdatedAt" field from the SQL query ---
-            # The database 'Sales' table does not have this column.
             sql_update = """
                 UPDATE Sales
-                SET Status = ?
+                SET Status = ?, UpdatedAt = GETDATE()
                 WHERE SaleID = ?
             """
+            # Note: Ensure your 'Sales' table has an 'UpdatedAt' column (datetime2)
+            # If not, remove it from the query: SET Status = ?
             await cursor.execute(sql_update, request.newStatus, parsed_id)
             
             if cursor.rowcount == 0:
@@ -270,7 +382,7 @@ async def get_all_orders(current_user: dict = Depends(get_current_active_user)):
                     si.SaleItemID, si.ItemName, si.Quantity, si.UnitPrice, si.Category, si.Addons
                 FROM Sales AS s
                 LEFT JOIN SaleItems AS si ON s.SaleID = si.SaleID
-                WHERE s.Status IN ('completed', 'processing')
+                WHERE s.Status IN ('completed', 'processing', 'cancelled')
                 ORDER BY s.CreatedAt DESC, s.SaleID DESC;
             """
             await cursor.execute(sql)

@@ -25,7 +25,8 @@ app.include_router(purchase_order.router_purchase_order)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://bleu-pos-eight.vercel.app", # pos frontend
+        "https://bleu-pos-eight.vercel.app",
+        "https://bleu-ims.vercel.app",
         "https://bleu-ums.onrender.com",
         "https://ingredient-services.onrender.com",
         "https://material-service.onrender.com",
