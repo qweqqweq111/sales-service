@@ -46,10 +46,9 @@ class Sale(BaseModel):
     orderType: str
     paymentMethod: str
     appliedDiscounts: List[str]
-    gcashReference: Optional[str] = None  # Add this field to accept the reference number
+    gcashReference: Optional[str] = None
 
 # --- Authorization Helper Function ---
-# ... (this function is unchanged)
 async def get_current_active_user(token: str = Depends(oauth2_scheme)):
     async with httpx.AsyncClient() as client:
         try:
@@ -70,7 +69,6 @@ async def get_current_active_user(token: str = Depends(oauth2_scheme)):
 
 
 # --- Helper functions to call Inventory Services ---
-# ... (these functions are unchanged)
 async def trigger_ingredients_deduction(cart_items: List[SaleItem], token: str):
     logger.info("Triggering INGREDIENT deduction.")
     payload = {"cartItems": [{"name": item.name, "quantity": item.quantity} for item in cart_items]}
@@ -97,7 +95,6 @@ async def trigger_materials_deduction(cart_items: List[SaleItem], token: str):
 
 
 # --- Helper function for calculations ---
-# --- FIX: This entire function is updated to use the correct database schema ---
 async def calculate_totals_and_discounts(sale_data: Sale, cursor):
     subtotal = Decimal('0.0')
     for item in sale_data.cartItems:
@@ -115,7 +112,6 @@ async def calculate_totals_and_discounts(sale_data: Sale, cursor):
         return subtotal, total_discount_amount, applied_discounts_details
 
     placeholders = ','.join(['?' for _ in sale_data.appliedDiscounts])
-    # Use the CORRECT column names from your database: name, discount_type, etc.
     sql_fetch_discounts = f"""
         SELECT id, name, discount_type, discount_value, minimum_spend
         FROM discounts
@@ -125,18 +121,15 @@ async def calculate_totals_and_discounts(sale_data: Sale, cursor):
     valid_discounts = await cursor.fetchall()
 
     for discount in valid_discounts:
-        # Use the correct snake_case column names
         min_spend = discount.minimum_spend or Decimal('0.0')
         if subtotal >= min_spend:
             discount_value = Decimal('0.0')
-            # Check discount_type and use the single discount_value column
             if discount.discount_type == 'percentage' and discount.discount_value is not None:
                 discount_value = (subtotal * Decimal(str(discount.discount_value))) / Decimal('100')
             elif discount.discount_type == 'fixed_amount' and discount.discount_value is not None:
                 discount_value = Decimal(str(discount.discount_value))
             
             total_discount_amount += discount_value
-            # Use the correct `id` column for the foreign key
             applied_discounts_details.append({"id": discount.id, "amount": discount_value})
 
     final_discount = min(total_discount_amount, subtotal)
@@ -149,9 +142,6 @@ async def create_sale(
     token: str = Depends(oauth2_scheme),
     current_user: dict = Depends(get_current_active_user)
 ):
-    """
-    Creates a new sale record and triggers both ingredient and material inventory deduction.
-    """
     allowed_roles = ["admin", "manager", "staff", "cashier"]
     if current_user.get("userRole") not in allowed_roles:
         raise HTTPException(
@@ -166,20 +156,18 @@ async def create_sale(
             subtotal, total_discount, discount_details = await calculate_totals_and_discounts(sale, cursor)
             cashier_name = current_user.get("username", "SystemUser")
 
-            # Updated SQL to include GCashReferenceNumber column
             sql_sale = """
                 INSERT INTO Sales (OrderType, PaymentMethod, CashierName, TotalDiscountAmount, GCashReferenceNumber) 
                 OUTPUT INSERTED.SaleID 
                 VALUES (?, ?, ?, ?, ?)
             """
-            # Updated execute call to pass the gcashReference
             await cursor.execute(
                 sql_sale, 
                 sale.orderType, 
                 sale.paymentMethod, 
                 cashier_name, 
                 total_discount, 
-                sale.gcashReference  # Pass the reference number here
+                sale.gcashReference
             )
             sale_id_row = await cursor.fetchone()
             if not sale_id_row or not sale_id_row[0]:
@@ -187,20 +175,19 @@ async def create_sale(
             sale_id = sale_id_row[0]
 
             for item in sale.cartItems:
-                sql_item = "INSERT INTO SaleItems (SaleID, ItemName, Quantity, UnitPrice, Category, Addons) VALUES (?, ?, ?, ?, ?, ?)"
+                # =================================================================================
+                # THE FIX IS HERE: The table name is corrected to 'SaleItem' (singular).
+                # =================================================================================
+                sql_item = "INSERT INTO SaleItem (SaleID, ItemName, Quantity, UnitPrice, Category, Addons) VALUES (?, ?, ?, ?, ?, ?)"
                 addons_str = json.dumps(item.addons) if item.addons else None
                 await cursor.execute(sql_item, sale_id, item.name, item.quantity, Decimal(str(item.price)), item.category, addons_str)
 
             for discount in discount_details:
-                # --- FIX: Use the correct column name 'DiscountID' as per your schema if that's its name
-                # Assuming the `SaleDiscounts` table has `DiscountID`. If it's `discount_id`, change it here.
                 sql_sale_discount = "INSERT INTO SaleDiscounts (SaleID, DiscountID, DiscountAppliedAmount) VALUES (?, ?, ?)"
                 await cursor.execute(sql_sale_discount, sale_id, discount['id'], discount['amount'])
 
-            # If all DB steps succeed, commit the changes.
             await conn.commit()
             
-            # After committing the sale, trigger inventory deductions.
             await trigger_ingredients_deduction(cart_items=sale.cartItems, token=token)
             await trigger_materials_deduction(cart_items=sale.cartItems, token=token)
             
@@ -213,7 +200,6 @@ async def create_sale(
             }
     except Exception as e:
         if conn: await conn.rollback()
-        # Log the full traceback for better debugging
         logger.error(f"Error processing sale: {e}", exc_info=True)
         if not isinstance(e, HTTPException):
              raise HTTPException(status_code=500, detail=f"An unexpected error occurred while processing the sale.")
