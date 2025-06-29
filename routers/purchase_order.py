@@ -122,7 +122,7 @@ async def get_processing_orders(
                     s.TotalDiscountAmount, s.Status,
                     si.SaleItemID, si.ItemName, si.Quantity, si.UnitPrice, si.Category, si.Addons
                 FROM Sales AS s
-                LEFT JOIN SaleItems AS si ON s.SaleID = si.SaleID
+                LEFT JOIN SaleItem AS si ON s.SaleID = si.SaleID
             WHERE s.Status IN ('processing', 'completed')
             """
             params = []
@@ -204,7 +204,7 @@ async def save_online_order(
 ):
     """
     Receives an order from the online/cart service and saves it into the
-    local POS database (`Sales` and `SaleItems` tables). This operation
+    local POS database (`Sales` and `SaleItem` tables). This operation
     is transactional.
     """
     allowed_roles = ["admin", "staff", "cashier"]
@@ -249,9 +249,9 @@ async def save_online_order(
                 raise Exception("Failed to create sale record and retrieve new SaleID.")
             new_sale_id = sale_id_row.SaleID
 
-            # 2. Insert into SaleItems table for each item in the order
+            # 2. Insert into SaleItem table for each item in the order
             sql_insert_item = """
-                INSERT INTO SaleItems (SaleID, ItemName, Quantity, UnitPrice, Category, Addons)
+                INSERT INTO SaleItem (SaleID, ItemName, Quantity, UnitPrice, Category, Addons)
                 VALUES (?, ?, ?, ?, ?, ?)
             """
             for item in order_data.items:
@@ -381,7 +381,7 @@ async def get_all_orders(current_user: dict = Depends(get_current_active_user)):
                     s.TotalDiscountAmount, s.Status, s.GCashReferenceNumber,
                     si.SaleItemID, si.ItemName, si.Quantity, si.UnitPrice, si.Category, si.Addons
                 FROM Sales AS s
-                LEFT JOIN SaleItems AS si ON s.SaleID = si.SaleID
+                LEFT JOIN SaleItem AS si ON s.SaleID = si.SaleID
                 WHERE s.Status IN ('completed', 'processing', 'cancelled')
                 ORDER BY s.CreatedAt DESC, s.SaleID DESC;
             """
